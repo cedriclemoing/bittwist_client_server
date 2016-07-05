@@ -1,6 +1,6 @@
 SHELL = /bin/sh
 
-prefix = /usr
+prefix ?= /usr
 exec_prefix = ${prefix}
 bindir = ${exec_prefix}/bin
 mandir = ${prefix}/share/man/man1
@@ -9,6 +9,7 @@ CC ?= gcc
 DEBUG = -g
 CFLAGS ?= -O2
 CFLAGS += $(DEBUG)
+CFLAGS += -pthread
 SRC = src
 DOC = doc
 

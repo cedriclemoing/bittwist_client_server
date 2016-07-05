@@ -57,6 +57,9 @@ struct pcap_sf_pkthdr {
 #define BITTWIST_VERSION    "2.0"
 #define BITTWISTE_VERSION   BITTWIST_VERSION
 
+#define FALSE				0
+#define TRUE				1
+
 #define ETHER_ADDR_LEN      6           /* Ethernet address length */
 #define ETHER_HDR_LEN       14          /* Ethernet header length */
 #define ETHER_MAX_LEN       1514        /* maximum frame length, excluding CRC */
@@ -108,6 +111,8 @@ struct pcap_sf_pkthdr {
     (ts)->tv_nsec = (tv)->tv_usec * 1000;   \
 }
 #endif
+
+#define INFO printf
 
 #define ROUND(f) (f >= 0 ? (long)(f + 0.5) : (long)(f - 0.5))
 

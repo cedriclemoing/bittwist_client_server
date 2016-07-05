@@ -18,6 +18,7 @@
  *
  */
 
+#include <semaphore.h>
 #include "bittwist.h"
 
 char *program_name;
@@ -25,6 +26,10 @@ char *program_name;
 int32_t thiszone; /* offset from GMT to local time in seconds */
 
 char ebuf[PCAP_ERRBUF_SIZE]; /* pcap error buffer */
+
+#define NOT_RECEIVED 0
+#define RECEIVED 1
+#define TIMEOUT_SEC 1
 
 /* options */
 int vflag = 0;      /* 1 - print timestamp, 2 - print timestamp and hex data */
@@ -34,8 +39,15 @@ int linerate = 0;   /* limit packet throughput at the specified Mbps (0 means no
 int interval = 0;   /* a constant interval in seconds (0 means actual interval will be used instead) */
 int max_pkts = 0;   /* send up to the specified number of packets */
 
-pcap_t *pd = NULL;          /* pcap descriptor */
-u_char *pkt_data = NULL;    /* packet data including the link-layer header */
+pcap_t *pcapdesc = NULL;          	/* pcap descriptor */
+int curr_pkt_len; 				/* packet length to send */
+u_char *curr_pkt_data = NULL;	/* packet data including the link-layer header */
+struct pcap_sf_pkthdr* pkt2Rcv_header = NULL;
+struct pcap_sf_pkthdr curr_pkt_header;
+
+int waitForPacket, firstPacket;
+sem_t semRdy;
+binary_semaphore bsemRx, bsemTx;
 
 /* stats */
 static u_int pkts_sent = 0;
@@ -44,33 +56,452 @@ static u_int failed = 0;
 struct timeval start = {0,0};
 struct timeval end = {0,0};
 
+struct timeval cur_ts;
+struct timeval prev_ts = {0,0};
+
+/**
+ * This function extracts the MAC address (from command line format 
+ * and sets the mac_addr struct)
+ *
+ */
+int
+extmac(char* new_rmac_ptr, u_char* new_rmac)
+{
+    if (sscanf (new_rmac_ptr, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", &new_rmac[0], &new_rmac[1],
+                    &new_rmac[2], &new_rmac[3], &new_rmac[4], &new_rmac[5]) != 6)
+        return 0;
+    return 1;
+}
+
+u_short extractSrcMacAddr(u_char *srcmacaddr,
+                       struct pcap_sf_pkthdr *header)
+{
+	
+    /*
+     * Ethernet header (14 bytes)
+     * 1. destination MAC (6 bytes)
+     * 2. source MAC (6 bytes)
+     * 3. type (2 bytes)
+     */
+    struct ether_header *eth_hdr;
+    u_short ether_type;
+    int i;
+
+    /* do nothing if Ethernet header is truncated */
+    if (header->caplen < ETHER_HDR_LEN)
+        return (0);
+
+    eth_hdr = (struct ether_header *)malloc(ETHER_HDR_LEN);
+    if (eth_hdr == NULL)
+        error("malloc(): cannot allocate memory for eth_hdr");
+
+    /* copy Ethernet header from pkt_data into eth_hdr */
+    memcpy(eth_hdr, curr_pkt_data, ETHER_HDR_LEN);
+    memcpy(srcmacaddr, eth_hdr->ether_shost, ETHER_ADDR_LEN);
+    
+    free(eth_hdr);
+                    
+    return 1;
+}
+
+void binsem_post(binary_semaphore *p)
+{
+    pthread_mutex_lock(&p->mutex);
+    p->v += 1;
+	pthread_cond_signal(&p->cvar);
+    pthread_mutex_unlock(&p->mutex);
+}
+
+void binsem_wait(binary_semaphore *p)
+{
+    pthread_mutex_lock(&p->mutex);
+	while (!p->v)
+        pthread_cond_wait(&p->cvar, &p->mutex);
+    p->v -= 1;
+    pthread_mutex_unlock(&p->mutex);
+}
+
+
+void binsem_wait_timeout(binary_semaphore *p)
+{
+	struct timespec ts;
+	int ret;
+		
+	if (clock_gettime(CLOCK_REALTIME, &ts) == -1) {
+		error("clock_gettime");
+	}
+	ts.tv_sec += TIMEOUT_RCVPKT;
+	
+    pthread_mutex_lock(&p->mutex);
+	ret = pthread_cond_timedwait(&p->cvar, &p->mutex, &ts);	
+	
+    p->v -= 1;
+    pthread_mutex_unlock(&p->mutex);
+}
+
+
+/* Callback function invoked by libpcap for every incoming packet */
+void packet_handler(u_char *param, const struct pcap_pkthdr *header, const u_char *pkt_data)
+{
+    struct tm *ltime;
+    char timestr[16];
+    time_t local_tv_sec;
+    
+    /* convert the timestamp to readable format */
+    local_tv_sec = header->ts.tv_sec;
+    ltime=localtime(&local_tv_sec);
+    strftime( timestr, sizeof timestr, "%H:%M:%S", ltime);
+    
+    if(vflag)
+		INFO("%s,%.6d len:%d\n", timestr, header->ts.tv_usec, header->len);
+ 
+	if(waitForPacket)
+	{		
+		// TODO replace those tests by test on IP checksum
+
+		if(header->len!=curr_pkt_header.len)
+			return;
+		
+		// check it's the packet we are waiting for
+		if(memcmp(curr_pkt_data, pkt_data, header->len)==0)
+		{
+			// convert the timestamp to readable format 
+			/*local_tv_sec = header.s.tv_sec;
+			ltime=localtime(&local_tv_sec);
+			strftime( timestr, sizeof timestr, "%H:%M:%S", ltime);
+			
+			printf("%s,%.6d len:%d\n", timestr, header.ts.tv_usec, header.len);*/
+			
+			if(vflag) INFO("PACKET RECEIVED\n");
+
+			/* copy timestamp for previous packet sent */
+			memcpy(&prev_ts, &cur_ts, sizeof(struct timeval));
+			
+			waitForPacket=0;
+			sem_post(&semRdy);
+			// wait for packet reader thread read next packet (server may reply quicker than thread reader to read next packet...)
+			binsem_wait_timeout(&bsemRx);
+		}
+	}
+}
+
+void* threadTx(void *arg)
+{
+	struct timeval ts;
+	
+	while(1)
+	{
+		binsem_wait(&bsemTx);
+		
+		/* finish the injection and verbose output before we give way to SIGINT */
+		if (pcap_sendpacket(pcapdesc, curr_pkt_data, curr_pkt_len) == -1) {
+			notice("%s", pcap_geterr(pcapdesc));
+			++failed;
+		}
+		else {
+			++pkts_sent;
+			bytes_sent += curr_pkt_len;
+
+			/* copy timestamp for previous packet sent */
+			memcpy(&prev_ts, &cur_ts, sizeof(struct timeval));
+
+			/* verbose output */
+			if (vflag) {
+				if (gettimeofday(&ts, NULL) == -1)
+					notice("gettimeofday(): %s", strerror(errno));
+				else
+					ts_print(&ts);
+
+				INFO("#%d (%d bytes)", pkts_sent, curr_pkt_len);
+
+				if (vflag > 1)
+					hex_print(curr_pkt_data, curr_pkt_len);
+				else
+					INFO("\n");
+			}
+		}
+		sem_post(&semRdy);
+	}
+	
+    return NULL;
+}
+
+
+int isBigEndian()
+{
+	int i=1;
+	char *tmp;
+	
+	tmp = (char*)&i;
+	if(*tmp==1) return TRUE;
+	else return FALSE;	
+}
+
+
+int send_packets(char *device, char *trace_file, int servermode, u_char *srcmacaddr)
+{
+    int ret, i, semRxVal, success=TRUE, isTXpacket=FALSE;
+    struct pcap_timeval p_ts;
+    struct timeval sleep = {0,0};
+    struct timespec nsleep;
+    u_char pcktsrcmacaddr[ETHER_ADDR_LEN];
+	struct timespec ts;
+	
+	FILE *fp; // file pointer to trace file 
+    struct pcap_file_header preamble;    
+
+    notice("trace file: %s", trace_file);
+    if ((fp = fopen(trace_file, "rb")) == NULL)
+        error("fopen(): error reading %s", trace_file);
+
+    /* preamble occupies the first 24 bytes of a trace file */
+    if (fread(&preamble, sizeof(preamble), 1, fp) == 0)
+        error("fread(): error reading %s", trace_file);
+    if (preamble.magic != PCAP_MAGIC)
+        error("%s is not a valid pcap based trace file %x %x", trace_file, preamble.magic, PCAP_MAGIC);    
+	
+	prev_ts.tv_usec=0;
+	prev_ts.tv_sec=0;
+	
+	while ((ret = fread(&curr_pkt_header, sizeof(curr_pkt_header), 1, fp))) 
+	{
+		if (ret == 0)
+			error("fread(): error reading %s", trace_file);
+
+		/* copy timestamp for current packet */
+        memcpy(&p_ts, &curr_pkt_header.ts, sizeof(p_ts));
+		
+		if(isBigEndian())
+		{
+			cur_ts.tv_sec = p_ts.tv_sec;
+			cur_ts.tv_usec = p_ts.tv_usec;
+		}
+		else
+		{
+			cur_ts.tv_sec = p_ts.tv_usec;
+			cur_ts.tv_usec = p_ts.tv_sec;
+		}
+
+        if (len < 0)        /* captured length */
+            curr_pkt_len = curr_pkt_header.caplen;
+        else if (len == 0)  /* actual length */
+            curr_pkt_len = curr_pkt_header.len;
+        else                /* user specified length */
+            curr_pkt_len = len;
+		
+		ret = fread(curr_pkt_data, 1, curr_pkt_len, fp);
+		if(ret!=curr_pkt_len)
+		{
+			for (i = ret; i < curr_pkt_len; i++)
+                /* pad trailing bytes with zeros */
+                curr_pkt_data[i] = PKT_PAD;
+		}
+
+        /*for (i = 0; i < curr_pkt_len; i++) {
+            // copy captured packet data starting from link-layer header 
+            if (i < curr_pkt_header.caplen) {
+                if ((ret = fgetc(fp)) == EOF)
+                    error("fgetc(): error reading %s", trace_file);
+                curr_pkt_data[i] = ret;
+            }
+            else
+                // pad trailing bytes with zeros 
+                curr_pkt_data[i] = PKT_PAD;
+        }*/
+				
+		if(!extractSrcMacAddr(pcktsrcmacaddr, &curr_pkt_header))
+			continue;
+
+		if((memcmp(srcmacaddr, pcktsrcmacaddr, ETHER_ADDR_LEN)==0 && servermode==0) ||
+			(memcmp(srcmacaddr, pcktsrcmacaddr, ETHER_ADDR_LEN)!=0 && servermode==1) )
+			isTXpacket = TRUE;
+		else isTXpacket = FALSE;
+        		
+#if 1
+		// only sleep for TX packets
+		if(isTXpacket)
+		{		
+			if (timerisset(&prev_ts)) { /* pass first packet */
+				if (speed != 0) {
+					if (interval > 0) {
+						/* user specified interval is in seconds only */
+						sleep.tv_sec = interval;
+						if (speed != 1)
+							timer_div(&sleep, speed); /* speed factor */
+					}
+					else {
+						/* grab captured interval */
+						timersub(&cur_ts, &prev_ts, &sleep);
+
+						if (speed != 1) {
+							if (sleep.tv_sec > SLEEP_MAX) /* to avoid integer overflow in timer_div() */
+								notice("ignoring speed due to large interval");
+							else
+								timer_div(&sleep, speed);
+						}
+					}
+
+					if (linerate > 0) {
+						i = linerate_interval(curr_pkt_len);
+						/* check if we exceed line rate */
+						if ((sleep.tv_sec == 0) && (sleep.tv_usec < i))
+							sleep.tv_usec = i; /* exceeded -> adjust */
+					}
+				}
+				else { /* send immediately */
+					if (linerate > 0)
+						sleep.tv_usec = linerate_interval(curr_pkt_len);
+				}
+
+				if (timerisset(&sleep)) {
+					//notice("sleep %d seconds %d microseconds", sleep.tv_sec, sleep.tv_usec);
+					TIMEVAL_TO_TIMESPEC(&sleep, &nsleep);
+					if (nanosleep(&nsleep, NULL) == -1) /* create the artificial slack time */
+						notice("nanosleep(): %s", strerror(errno));
+				}
+			}
+		}
+#endif  
+        /* move file pointer to the end of this packet data */
+        if (i < curr_pkt_header.caplen) {
+            if (fseek(fp, curr_pkt_header.caplen - curr_pkt_len, SEEK_CUR) != 0)
+                error("fseek(): error reading %s", trace_file);
+        }
+
+		if(srcmacaddr!=NULL)
+		{
+			// in servermode, do not send packets having source adress mac == srcmacaddrstr
+			// this should be send by the client => wait to receive it
+			if(isTXpacket)
+			{		
+				// unlock Rx thread (may be locked waiting reader thread to read next packet)
+				if(firstPacket==1) firstPacket=0;
+				else binsem_post(&bsemRx);
+				binsem_post(&bsemTx);
+				
+				// wait for the packet to be sent
+				sem_wait(&semRdy);
+			}
+			else
+			{
+				// wait for packet reception
+				waitForPacket=1;
+				// unlock Rx thread (may be locked waiting reader thread to read next packet)
+				if(firstPacket==1) firstPacket=0;
+				else binsem_post(&bsemRx);
+
+				// the thread may be waiting for a packet response, but the other side may not have received it
+				if (clock_gettime(CLOCK_REALTIME, &ts) == -1) {
+					error("clock_gettime");
+				}
+				ts.tv_sec += TIMEOUT_RCVPKT;    
+				
+				while ((ret = sem_timedwait(&semRdy, &ts)) == -1 && errno == EINTR)
+					continue;       /* Restart if interrupted by handler */
+					
+				// Check what happened
+				if (ret == -1) {
+					if (errno == ETIMEDOUT)
+						INFO("sem_timedwait() timed out\n");
+					else
+						error("sem_timedwait");
+					
+					success=FALSE;
+					break;
+				} 			
+			}
+		}
+		else
+		{
+			// classic pcap player mode
+			binsem_post(&bsemTx);
+			// wait for the packet to be sent
+			sem_wait(&semRdy);
+		}
+	}
+	
+	(void)fclose(fp);
+	return success;
+}
+
+void* packetReaderThread(void *arg)
+{
+	int i, incr=0, loop=1;
+	packetReaderArgs *args=(packetReaderArgs*)arg;
+		
+    if (args->loop > 0) 
+	{
+		incr=-1;
+		loop=args->loop;
+	}
+
+	while (loop) {
+		for (i = optind; i < args->argc; i++) 
+		{
+			int retry=0;
+			waitForPacket=0;
+			firstPacket=1;
+
+			while(retry++<MAX_NB_SEND_RETRY)
+			{
+				if(!send_packets(args->device, args->argv[i], args->servermode, args->srcmacaddr)) 
+				{
+					INFO("send_packets failed, retry\n");
+					if(retry==MAX_NB_SEND_RETRY) error("send_packets max retry reached\n");
+				}
+				else 
+				{
+					INFO("send_packets succeed !!\n");
+					break;
+				}
+			}
+			
+		}
+		
+		// unlock Rx Thread (last packet from file processed, but it may be waiting from reader thread to read one)
+		binsem_post(&bsemRx);
+		loop+=incr;
+	}	
+	
+	pcap_breakloop(pcapdesc);
+	pcap_close(pcapdesc);
+	return NULL;
+}
+
 int main(int argc, char **argv)
 {
     char *cp;
-    int c;
+    int c, err;
     pcap_if_t *devptr;
     int i;
     int devnum;
     char *device = NULL;
     int loop = 1;
     thiszone = gmt2local(0);
-
+    pcap_if_t *alldevs, *d;
+	packetReaderArgs pktReaderArgs;
+	char *trace_file, srcmacaddr[ETHER_ADDR_LEN];
+	int servermode=0;
+	
+    pthread_t threadTxId, packetReaderThreadId;
+	
+	pktReaderArgs.srcmacaddr = NULL;	
     if ((cp = strrchr(argv[0], '/')) != NULL)
         program_name = cp + 1;
     else
         program_name = argv[0];
 
     /* process options */
-    while ((c = getopt(argc, argv, "dvi:s:l:c:m:r:p:h")) != -1) {
+    while ((c = getopt(argc, argv, "dvxi:s:l:c:m:r:p:w:h")) != -1) {
         switch (c) {
             case 'd':
                 if (pcap_findalldevs(&devptr, ebuf) < 0)
                     error("%s", ebuf);
                 else {
                     for (i = 0; devptr != 0; i++) {
-                        (void)printf("%d. %s", i + 1, devptr->name);
+                        INFO("%d. %s", i + 1, devptr->name);
                         if (devptr->description != NULL)
-                            (void)printf(" (%s)", devptr->description);
+                            INFO(" (%s)", devptr->description);
                         (void)putchar('\n');
                         devptr = devptr->next;
                     }
@@ -125,211 +556,114 @@ int main(int argc, char **argv)
                 if (interval < 1 || interval > SLEEP_MAX)
                     error("value for sleep must be between 1 to %d", SLEEP_MAX);
                 break;
+            case 'w':
+				/* These function setup the MAC & IP addresses in the mac_addr & in_addr structs */
+				pktReaderArgs.srcmacaddr = srcmacaddr;
+				if (extmac(optarg, pktReaderArgs.srcmacaddr) == 0)
+					errx(-1, "incorrect source mac %s\n", optarg);
+                break;
+            case 'x':
+				servermode=1;
+                break;
             case 'h':
             default:
                 usage();
         }
     }
 
-    if (device == NULL)
-        error("device not specified");
-
     if (argv[optind] == NULL)
         error("trace file not specified");
 
     notice("sending packets through %s", device);
 
+    /* buffer to store data for each packet including its link-layer header, freed in cleanup() */
+    curr_pkt_data = (u_char *)malloc(sizeof(u_char) * ETHER_MAX_LEN);
+    if (curr_pkt_data == NULL)
+        error("malloc(): cannot allocate memory for curr_pkt_data");
+    memset(curr_pkt_data, 0, ETHER_MAX_LEN);
+
     /* empty error buffer to grab warning message (if exist) from pcap_open_live() below */
     *ebuf = '\0';
-
+	
     /* note that we are doing this for sending packets, not capture */
-    pd = pcap_open_live(device,
+    pcapdesc = pcap_open_live(device,
                         ETHER_MAX_LEN,  /* portion of packet to capture */
                         1,              /* promiscuous mode is on */
-                        1000,           /* read timeout, in milliseconds */
+                        10,             /* read timeout, in milliseconds */
                         ebuf);
-
-    if (pd == NULL)
+    
+    if (pcapdesc == NULL)
         error("%s", ebuf);
     else if (*ebuf)
         notice("%s", ebuf); /* warning message from pcap_open_live() above */
 
-    /* buffer to store data for each packet including its link-layer header, freed in cleanup() */
-    pkt_data = (u_char *)malloc(sizeof(u_char) * ETHER_MAX_LEN);
-    if (pkt_data == NULL)
-        error("malloc(): cannot allocate memory for pkt_data");
-    memset(pkt_data, 0, ETHER_MAX_LEN);
+
+	sem_init(&semRdy, 1, 0); 
+		
+	bsemRx.v=0;
+	bsemTx.v=0;
+	if (pthread_mutex_init(&bsemRx.mutex, NULL) != 0 || pthread_cond_init(&bsemRx.cvar, NULL) != 0)
+	{
+		error("\n mutex init failed\n");
+		return;
+	}	
+	if (pthread_mutex_init(&bsemTx.mutex, NULL) != 0 || pthread_cond_init(&bsemTx.cvar, NULL) != 0)
+	{
+		error("\n mutex init failed\n");
+		return;
+	}	
+			
+	err = pthread_create(&threadTxId, NULL, &threadTx, NULL);
+	if (err != 0)
+		error("\ncan't create thread :[%s]", strerror(err));
+	else
+		INFO("\n Thread created successfully\n");
+
+	pktReaderArgs.optind=optind;
+	pktReaderArgs.argc=argc;
+	pktReaderArgs.argv=argv;
+	pktReaderArgs.device=device;
+	pktReaderArgs.loop=loop;
+	pktReaderArgs.servermode=servermode;
+
+	err = pthread_create(&packetReaderThreadId, NULL, &packetReaderThread, &pktReaderArgs);
+	if (err != 0)
+		error("\ncan't create thread :[%s]", strerror(err));
+	else
+		INFO("\n Thread created successfully\n");
+    	
+    /*if(srcipaddrstr)
+    {
+	// Retrieve the device list 
+	if (pcap_findalldevs_ex(PCAP_SRC_IF_STRING, NULL, &alldevs, ebuf) == -1)
+	{
+		error(stderr,"Error in pcap_findalldevs: %s\n", ebuf);
+	}
+
+	// Jump to the selected adapter 
+	for(d=alldevs, i=0; i< device-1 ;d=d->next, i++);    
+
+	if(d->addresses != NULL)
+	{
+		// Retrieve the address of the interface 
+		netmask=((struct sockaddr_in *)(d->addresses->addr))->sin_addr.S_un.S_addr;    
+		//char *ip = inet_ntoa(their_addr.sin_addr)
+	}
+    }*/
 
     /* set signal handler for SIGINT (Control-C) */
     (void)signal(SIGINT, cleanup);
 
     if (gettimeofday(&start, NULL) == -1)
         notice("gettimeofday(): %s", strerror(errno));
-
-    if (loop > 0) {
-        while (loop--) {
-            for (i = optind; i < argc; i++) /* for each trace file */
-                send_packets(device, argv[i]);
-        }
-    }
-    /* send infinitely if loop <= 0 until user Control-C */
-    else {
-        while (1) {
-            for (i = optind; i < argc; i++)
-                send_packets(device, argv[i]);
-        }
-    }
+    
+    /* start the capture */
+    pcap_loop(pcapdesc, 0, packet_handler, NULL);    
 
     cleanup(0);
 
     /* NOTREACHED */
     exit(EXIT_SUCCESS);
-}
-
-void send_packets(char *device, char *trace_file)
-{
-    FILE *fp; /* file pointer to trace file */
-    struct pcap_file_header preamble;
-    struct pcap_sf_pkthdr header;
-    int pkt_len; /* packet length to send */
-    int ret;
-    int i;
-    struct pcap_timeval p_ts;
-    struct timeval ts;
-    struct timeval sleep = {0,0};
-    struct timeval cur_ts;
-    struct timeval prev_ts = {0,0};
-    struct timespec nsleep;
-    sigset_t block_sig;
-
-    (void)sigemptyset(&block_sig);
-    (void)sigaddset(&block_sig, SIGINT);
-
-    notice("trace file: %s", trace_file);
-    if ((fp = fopen(trace_file, "rb")) == NULL)
-        error("fopen(): error reading %s", trace_file);
-
-    /* preamble occupies the first 24 bytes of a trace file */
-    if (fread(&preamble, sizeof(preamble), 1, fp) == 0)
-        error("fread(): error reading %s", trace_file);
-    if (preamble.magic != PCAP_MAGIC)
-        error("%s is not a valid pcap based trace file", trace_file);
-
-    /*
-     * loop through the remaining data by reading the packet header first.
-     * packet header (16 bytes) = timestamp + length
-     */
-    while ((ret = fread(&header, sizeof(header), 1, fp))) {
-        if (ret == 0)
-            error("fread(): error reading %s", trace_file);
-
-        /* copy timestamp for current packet */
-        memcpy(&p_ts, &header.ts, sizeof(p_ts));
-        cur_ts.tv_sec = p_ts.tv_sec;
-        cur_ts.tv_usec = p_ts.tv_usec;
-
-        if (len < 0)        /* captured length */
-            pkt_len = header.caplen;
-        else if (len == 0)  /* actual length */
-            pkt_len = header.len;
-        else                /* user specified length */
-            pkt_len = len;
-
-        if (timerisset(&prev_ts)) { /* pass first packet */
-            if (speed != 0) {
-                if (interval > 0) {
-                    /* user specified interval is in seconds only */
-                    sleep.tv_sec = interval;
-                    if (speed != 1)
-                        timer_div(&sleep, speed); /* speed factor */
-                }
-                else {
-                    /* grab captured interval */
-                    timersub(&cur_ts, &prev_ts, &sleep);
-                    if (speed != 1) {
-                        if (sleep.tv_sec > SLEEP_MAX) /* to avoid integer overflow in timer_div() */
-                            notice("ignoring speed due to large interval");
-                        else
-                            timer_div(&sleep, speed);
-                    }
-                }
-
-                if (linerate > 0) {
-                    i = linerate_interval(pkt_len);
-                    /* check if we exceed line rate */
-                    if ((sleep.tv_sec == 0) && (sleep.tv_usec < i))
-                        sleep.tv_usec = i; /* exceeded -> adjust */
-                }
-            }
-            else { /* send immediately */
-                if (linerate > 0)
-                    sleep.tv_usec = linerate_interval(pkt_len);
-            }
-
-            if (timerisset(&sleep)) {
-                /* notice("sleep %d seconds %d microseconds", sleep.tv_sec, sleep.tv_usec); */
-                TIMEVAL_TO_TIMESPEC(&sleep, &nsleep);
-                if (nanosleep(&nsleep, NULL) == -1) /* create the artificial slack time */
-                    notice("nanosleep(): %s", strerror(errno));
-            }
-        }
-
-        for (i = 0; i < pkt_len; i++) {
-            /* copy captured packet data starting from link-layer header */
-            if (i < header.caplen) {
-                if ((ret = fgetc(fp)) == EOF)
-                    error("fgetc(): error reading %s", trace_file);
-                pkt_data[i] = ret;
-            }
-            else
-                /* pad trailing bytes with zeros */
-                pkt_data[i] = PKT_PAD;
-        }
-        /* move file pointer to the end of this packet data */
-        if (i < header.caplen) {
-            if (fseek(fp, header.caplen - pkt_len, SEEK_CUR) != 0)
-                error("fseek(): error reading %s", trace_file);
-        }
-
-        (void)sigprocmask(SIG_BLOCK, &block_sig, NULL); /* hold SIGINT */
-
-        /* finish the injection and verbose output before we give way to SIGINT */
-        if (pcap_sendpacket(pd, pkt_data, pkt_len) == -1) {
-            notice("%s", pcap_geterr(pd));
-            ++failed;
-        }
-        else {
-            ++pkts_sent;
-            bytes_sent += pkt_len;
-
-            /* copy timestamp for previous packet sent */
-            memcpy(&prev_ts, &cur_ts, sizeof(struct timeval));
-
-            /* verbose output */
-            if (vflag) {
-                if (gettimeofday(&ts, NULL) == -1)
-                    notice("gettimeofday(): %s", strerror(errno));
-                else
-                    ts_print(&ts);
-
-                (void)printf("#%d (%d bytes)", pkts_sent, pkt_len);
-
-                if (vflag > 1)
-                    hex_print(pkt_data, pkt_len);
-                else
-                    putchar('\n');
-
-                fflush(stdout);
-            }
-        }
-
-        (void)sigprocmask(SIG_UNBLOCK, &block_sig, NULL); /* release SIGINT */
-
-        if ((max_pkts > 0) && (pkts_sent >= max_pkts))
-            cleanup(0);
-    } /* end while */
-
-    (void)fclose(fp);
 }
 
 /*
@@ -369,7 +703,8 @@ void info(void)
 
 void cleanup(int signum)
 {
-    free(pkt_data); pkt_data = NULL;
+    free(curr_pkt_data); 
+	curr_pkt_data = NULL;
     if (signum == -1)
         exit(EXIT_FAILURE);
     else
@@ -540,6 +875,8 @@ void usage(void)
         " -p sleep       Set interval to 'sleep' (in seconds), ignoring the actual\n"
         "                interval.\n"
         "                Value for 'sleep' must be between 1 to %d.\n"
+        " -w macaddr     only sends packets from this source.\n"
+        " -x             Set server mode.\n"
         " -h             Print version information and usage.\n",
         program_name, BITTWIST_VERSION, pcap_lib_version(), program_name, ETHER_HDR_LEN,
         ETHER_MAX_LEN, SPEED_MIN, LINERATE_MIN, LINERATE_MAX, SLEEP_MAX);

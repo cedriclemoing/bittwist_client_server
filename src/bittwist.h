@@ -23,7 +23,7 @@
 
 #include "def.h"
 
-void send_packets(char *device, char *trace_file);
+int send_packets(char *device, char *trace_file, int servermode, u_char *srcmacaddr);
 int linerate_interval(int pkt_len);
 void info(void);
 void cleanup(int signum);
@@ -34,5 +34,36 @@ void ts_print(register const struct timeval *tvp);
 void notice(const char *fmt, ...);
 void error(const char *fmt, ...);
 void usage(void);
+
+// set timeout to restart packet sending from the begining
+#define TIMEOUT_RCVPKT 10
+// number of retries per input pcap file (retry occurs upon a packet loss, or server-client synchronization problem)
+#define MAX_NB_SEND_RETRY 10
+
+// 6 byte MAC Address
+struct mac_addr { 
+    unsigned char byte1; 
+    unsigned char byte2; 
+    unsigned char byte3; 
+    unsigned char byte4; 
+    unsigned char byte5; 
+    unsigned char byte6; 
+};
+	
+typedef struct {
+	int optind;
+    int argc;
+    char **argv;
+	char *device;
+	int loop;
+	int servermode;
+	u_char *srcmacaddr;
+} packetReaderArgs;
+
+typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t cvar;
+    int v;
+} binary_semaphore;
 
 #endif  /* !_BITTWIST_H_ */
