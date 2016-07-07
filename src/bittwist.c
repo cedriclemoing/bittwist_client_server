@@ -117,7 +117,7 @@ void binsem_wait(binary_semaphore *p)
     pthread_mutex_lock(&p->mutex);
 	while (!p->v)
         pthread_cond_wait(&p->cvar, &p->mutex);
-    p->v -= 1;
+    p->v -=1;
     pthread_mutex_unlock(&p->mutex);
 }
 
@@ -133,9 +133,10 @@ void binsem_wait_timeout(binary_semaphore *p)
 	ts.tv_sec += TIMEOUT_RCVPKT;
 	
     pthread_mutex_lock(&p->mutex);
-	ret = pthread_cond_timedwait(&p->cvar, &p->mutex, &ts);	
 	
-    p->v -= 1;
+	while (!p->v)
+		ret = pthread_cond_timedwait(&p->cvar, &p->mutex, &ts);		
+    p->v -=1;
     pthread_mutex_unlock(&p->mutex);
 }
 
@@ -226,18 +227,6 @@ void* threadTx(void *arg)
     return NULL;
 }
 
-
-int isBigEndian()
-{
-	int i=1;
-	char *tmp;
-	
-	tmp = (char*)&i;
-	if(*tmp==1) return TRUE;
-	else return FALSE;	
-}
-
-
 int send_packets(char *device, char *trace_file, int servermode, u_char *srcmacaddr)
 {
     int ret, i, semRxVal, success=TRUE, isTXpacket=FALSE;
@@ -270,17 +259,8 @@ int send_packets(char *device, char *trace_file, int servermode, u_char *srcmaca
 
 		/* copy timestamp for current packet */
         memcpy(&p_ts, &curr_pkt_header.ts, sizeof(p_ts));
-		
-		if(isBigEndian())
-		{
-			cur_ts.tv_sec = p_ts.tv_sec;
-			cur_ts.tv_usec = p_ts.tv_usec;
-		}
-		else
-		{
-			cur_ts.tv_sec = p_ts.tv_usec;
-			cur_ts.tv_usec = p_ts.tv_sec;
-		}
+		cur_ts.tv_sec = p_ts.tv_sec;
+		cur_ts.tv_usec = p_ts.tv_usec;
 
         if (len < 0)        /* captured length */
             curr_pkt_len = curr_pkt_header.caplen;
@@ -374,9 +354,6 @@ int send_packets(char *device, char *trace_file, int servermode, u_char *srcmaca
 			// this should be send by the client => wait to receive it
 			if(isTXpacket)
 			{		
-				// unlock Rx thread (may be locked waiting reader thread to read next packet)
-				if(firstPacket==1) firstPacket=0;
-				else binsem_post(&bsemRx);
 				binsem_post(&bsemTx);
 				
 				// wait for the packet to be sent
@@ -395,7 +372,6 @@ int send_packets(char *device, char *trace_file, int servermode, u_char *srcmaca
 					error("clock_gettime");
 				}
 				ts.tv_sec += TIMEOUT_RCVPKT;    
-				
 				while ((ret = sem_timedwait(&semRdy, &ts)) == -1 && errno == EINTR)
 					continue;       /* Restart if interrupted by handler */
 					
@@ -439,11 +415,16 @@ void* packetReaderThread(void *arg)
 		for (i = optind; i < args->argc; i++) 
 		{
 			int retry=0;
-			waitForPacket=0;
-			firstPacket=1;
-
+			
 			while(retry++<MAX_NB_SEND_RETRY)
 			{
+				waitForPacket=0;
+				firstPacket=1;
+				
+				bsemRx.v=0;
+				bsemTx.v=0;
+				
+				
 				if(!send_packets(args->device, args->argv[i], args->servermode, args->srcmacaddr)) 
 				{
 					INFO("send_packets failed, retry\n");
